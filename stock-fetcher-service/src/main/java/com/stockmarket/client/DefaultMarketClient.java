@@ -98,7 +98,7 @@ public class DefaultMarketClient implements ExternalMarketClient {
             final Map<String, String> params = new HashMap<>();
             params.put("interval", interval);
             params.put("range", range);
-            String url = httpClient.buildUrlWithAuth(config.getChartEndpoint(),symbol, params);
+            String url = httpClient.buildUrlWithAuth(config.getChartEndpoint(), symbol, params);
             log.info("Chart URL: {}", url);
 
             String response = Jsoup.connect(url)
@@ -135,14 +135,16 @@ public class DefaultMarketClient implements ExternalMarketClient {
 
             JsonNode opens = quote.path("open");
             JsonNode highs = quote.path("high");
-            JsonNode lows  = quote.path("low");
-            JsonNode closes= quote.path("close");
-            JsonNode volumes=quote.path("volume");
+            JsonNode lows = quote.path("low");
+            JsonNode closes = quote.path("close");
+            JsonNode volumes = quote.path("volume");
 
             List<ChartPoint> points = new ArrayList<>();
 
             for (int i = 0; i < timestamps.size(); i++) {
-                if (opens.get(i).isNull()) continue;
+                if (opens.get(i).isNull()) {
+                    continue;
+                }
 
                 final ChartPoint point = new ChartPoint();
                 point.setTimestamp(timestamps.get(i).asLong() * 1000);
@@ -218,102 +220,185 @@ public class DefaultMarketClient implements ExternalMarketClient {
 
     @Override
     public CompanySummary fetchCompanySummary(String symbol) {
-        int attempts = 0;
+        int attempts   = 0;
         int maxRetries = config.getMaxRetries();
 
         while (attempts < maxRetries) {
             attempts++;
             try {
                 final Map<String, String> params = new HashMap<>();
-                params.put("modules", "price,summaryDetail,defaultKeyStatistics,assetProfile");
+                params.put("modules",
+                        "price,summaryDetail,defaultKeyStatistics,assetProfile,calendarEvents,financialData");
 
-                // Build URL with auth (crumb)
                 String url = httpClient.buildUrlWithAuth(
-                        config.getCompanySummaryEndpoint(),
-                        symbol,
-                        params
-                );
+                        config.getCompanySummaryEndpoint(), symbol, params);
 
                 log.info("Fetching company summary for {} (attempt {})", symbol, attempts);
                 log.debug("URL: {}", url);
 
-                // USE httpClient.executeGet() instead of Jsoup directly
-                // This automatically includes cookies + headers from auth context
-                String response = httpClient.executeGet(url);
-
-                JsonNode root = MAPPER.readTree(response);
-
+                String   response = httpClient.executeGet(url);
+                JsonNode root     = MAPPER.readTree(response);
                 log.debug("Company summary payload for {}: {}", symbol, root);
-                // Check for errors in response
+
+                // ── Error check ───────────────────────────────────────────────────
                 JsonNode errorNode = root.path("finance").path("error");
                 if (!errorNode.isMissingNode() && !errorNode.isNull()) {
                     String code = errorNode.path("code").asText();
                     String desc = errorNode.path("description").asText();
-
                     log.warn("API error - Code: {}, Description: {}", code, desc);
 
-                    // If unauthorized or invalid crumb, refresh auth and retry
                     if ("Unauthorized".equals(code) && attempts < maxRetries) {
                         log.warn("Invalid crumb/auth, refreshing and retrying...");
                         authService.invalidate();
                         authService.refreshAuthContext();
-                        continue; // retry
+                        continue;
                     }
-
                     throw new RuntimeException("API error: " + code + " - " + desc);
                 }
 
                 JsonNode result = root.path("quoteSummary").path("result").get(0);
-
                 if (result == null || result.isMissingNode()) {
                     throw new RuntimeException("No summary data available for " + symbol);
                 }
 
-                JsonNode price = result.path("price");
-                JsonNode detail = result.path("summaryDetail");
+                // ── Module nodes ──────────────────────────────────────────────────
+                JsonNode price    = result.path("price");
+                JsonNode detail   = result.path("summaryDetail");
+                JsonNode stats    = result.path("defaultKeyStatistics");
+                JsonNode profile  = result.path("assetProfile");
+                JsonNode calendar = result.path("calendarEvents");
+                JsonNode finData  = result.path("financialData");
 
-                JsonNode stats = result.path("defaultKeyStatistics");
-                JsonNode  industry = result.path("assetProfile").path("industry");
-                JsonNode businessSummary = result.path("assetProfile").path("longBusinessSummary");
+                // ── Address ───────────────────────────────────────────────────────
+                String address1 = profile.path("address1").asText("");
+                String address2 = profile.path("address2").asText("");
+                String city     = profile.path("city").asText("");
+                String zipcode  = profile.path("zip").asText("");
+                String country  = profile.path("country").asText("");
+                String phone    = profile.path("phone").asText("");
+                String website  = profile.path("website").asText("");
 
-                String address1 = result.path("assetProfile").path("address1").asText("");
-                String address2 = result.path("assetProfile").path("address2").asText("");
-                String city = result.path("assetProfile").path("city").asText("");
-                String zipcode = result.path("assetProfile").path("zip").asText("");
-                String country = result.path("assetProfile").path("country").asText("");
-                String phone = result.path("assetProfile").path("phone").asText("");
-                String website = result.path("assetProfile").path("website").asText("");
+                String address = Stream.of(
+                                address1,
+                                address2,
+                                city + (zipcode.isBlank() ? "" : " – " + zipcode),
+                                country, phone, website
+                        ).filter(s -> s != null && !s.isBlank())
+                        .collect(Collectors.joining(System.lineSeparator()));
 
-                String address = Stream.of(address1, address2, city + (zipcode.isBlank() ? "" : " – " + zipcode), country, phone, website).filter(s->s!=null && !s.isBlank()).collect(
-                        Collectors.joining(System.lineSeparator()));
+                // ── Earnings date ─────────────────────────────────────────────────
+                JsonNode earningsDateNode = calendar.path("earnings").path("earningsDate");
+                String earningsDate = "";
+                if (earningsDateNode.isArray() && earningsDateNode.size() > 0) {
+                    earningsDate = earningsDateNode.get(0).path("fmt").asText("");
+                }
 
-                double pe =
-                        stats.path("trailingPE").path("raw").asDouble(
-                                stats.path("forwardPE").path("raw").asDouble(0)
-                        );
+                // ── P/E: prefer trailing, fall back to forward ────────────────────
+                double peRatio = stats.path("trailingPE").path("raw").asDouble(
+                        stats.path("forwardPE").path("raw").asDouble(0)
+                );
 
-                final CompanySummary companySummary = new CompanySummary();
-                companySummary.setSymbol(symbol);
-                companySummary.setCompanyName(price.path("longName").asText(""));
-                companySummary.setSector(result.path("assetProfile").path("sector").asText(""));
-                companySummary.setIndustry(industry.asText());
-                companySummary.setBusinessSummary(businessSummary.asText());
-                companySummary.setAddress(address);
-                companySummary.setMarketCap(detail.path("marketCap").path("raw").asDouble(0));
-                companySummary.setPeRatio(pe);
-                companySummary.setWeek52High(detail.path("fiftyTwoWeekHigh").path("raw").asDouble(0));
-                companySummary.setWeek52Low(detail.path("fiftyTwoWeekLow").path("raw").asDouble(0));
+                // ── Derived values ────────────────────────────────────────────────
+                double previousClose  = price.path("regularMarketPreviousClose").path("raw").asDouble(0);
+                double marketCapRaw   = detail.path("marketCap").path("raw").asDouble(0);
+
+                // ── Build DTO ─────────────────────────────────────────────────────
+                final CompanySummary cs = new CompanySummary();
+
+                // Identity
+                cs.setSymbol(symbol);
+                cs.setCompanyName(price.path("longName").asText(""));
+                cs.setSector(profile.path("sector").asText(""));
+                cs.setIndustry(profile.path("industry").asText(""));
+                cs.setExchange(price.path("exchangeName").asText(""));
+                cs.setMarketCapCategory(resolveMarketCapCategory(marketCapRaw));
+                cs.setBusinessSummary(profile.path("longBusinessSummary").asText(""));
+                cs.setAddress(address);
+                cs.setWebsite(website);
+                cs.setFullTimeEmployees(profile.path("fullTimeEmployees").asInt(0));
+                cs.setEarningsDate(earningsDate);
+
+                // Live price
+                cs.setRegularMarketPrice(price.path("regularMarketPrice").path("raw").asDouble(0));
+                cs.setRegularMarketChange(price.path("regularMarketChange").path("raw").asDouble(0));
+                cs.setRegularMarketChangePercent(
+                        price.path("regularMarketChangePercent").path("raw").asDouble(0) * 100);
+                cs.setRegularMarketDayOpen(price.path("regularMarketOpen").path("raw").asDouble(0));
+                cs.setRegularMarketDayHigh(price.path("regularMarketDayHigh").path("raw").asDouble(0));
+                cs.setRegularMarketDayLow(price.path("regularMarketDayLow").path("raw").asDouble(0));
+                cs.setRegularMarketVolume(price.path("regularMarketVolume").path("raw").asLong(0));
+                cs.setRegularMarketPreviousClose(previousClose);
+                cs.setMarketState(price.path("marketState").asText("UNKNOWN"));
+
+                // 52-Week
+                cs.setWeek52High(detail.path("fiftyTwoWeekHigh").path("raw").asDouble(0));
+                cs.setWeek52Low(detail.path("fiftyTwoWeekLow").path("raw").asDouble(0));
+                cs.setWeek52Change(stats.path("52WeekChange").path("raw").asDouble(0) * 100);
+
+                // Market Cap
+                cs.setMarketCap(marketCapRaw);
+                cs.setMarketCapFormatted(formatToLakhCrore(marketCapRaw));
+
+                // Valuation
+                cs.setPeRatio(peRatio);
+                cs.setForwardPE(stats.path("forwardPE").path("raw").asDouble(0));
+                cs.setPriceToBook(stats.path("priceToBook").path("raw").asDouble(0));
+                cs.setPriceToSales(detail.path("priceToSalesTrailing12Months").path("raw").asDouble(0));
+
+                // Moving Averages
+                cs.setFiftyDayAverage(detail.path("fiftyDayAverage").path("raw").asDouble(0));
+                cs.setTwoHundredDayAverage(detail.path("twoHundredDayAverage").path("raw").asDouble(0));
+
+                // Dividends (yield stored as %, e.g. 0.43)
+                cs.setDividendRate(detail.path("dividendRate").path("raw").asDouble(0));
+                cs.setDividendYield(detail.path("dividendYield").path("raw").asDouble(0) * 100);
+                cs.setExDividendDate(detail.path("exDividendDate").path("fmt").asText(""));
+                cs.setPayoutRatio(detail.path("payoutRatio").path("raw").asDouble(0) * 100);
+
+                // EPS
+                cs.setEpsTrailingTwelveMonths(stats.path("trailingEps").path("raw").asDouble(0));
+                cs.setEpsForward(stats.path("forwardEps").path("raw").asDouble(0));
+
+                // Volume
+                cs.setAverageVolume3Month(detail.path("averageVolume").path("raw").asLong(0));
+                cs.setAverageVolume10Day(detail.path("averageVolume10days").path("raw").asLong(0));
+
+                // Earnings & Margins
+                cs.setProfitMargin(stats.path("profitMargins").path("raw").asDouble(0) * 100);
+                cs.setEarningsGrowthQoQ(stats.path("earningsQuarterlyGrowth").path("raw").asDouble(0) * 100);
+                cs.setNetIncome(stats.path("netIncomeToCommon").path("raw").asDouble(0));
+
+                // Enterprise Value
+                cs.setEnterpriseValue(stats.path("enterpriseValue").path("raw").asDouble(0));
+                cs.setEvToRevenue(stats.path("enterpriseToRevenue").path("raw").asDouble(0));
+                cs.setEvToEbitda(stats.path("enterpriseToEbitda").path("raw").asDouble(0));
+
+                // Shares & Ownership
+                cs.setSharesOutstanding(stats.path("sharesOutstanding").path("raw").asLong(0));
+                cs.setInsiderHolding(stats.path("heldPercentInsiders").path("raw").asDouble(0) * 100);
+                cs.setInstitutionalHolding(stats.path("heldPercentInstitutions").path("raw").asDouble(0) * 100);
+                cs.setBeta(detail.path("beta").path("raw").asDouble(0));
+                cs.setBookValue(stats.path("bookValue").path("raw").asDouble(0));
+
+                // Circuit Limits (±20%)
+                cs.setUpperCircuit(previousClose * 1.20);
+                cs.setLowerCircuit(previousClose * 0.80);
+
+                // Analyst
+                cs.setAnalystRating(finData.path("recommendationKey").asText(""));
+                cs.setTargetMeanPrice(finData.path("targetMeanPrice").path("raw").asDouble(0));
+                cs.setNumberOfAnalystOpinions(
+                        finData.path("numberOfAnalystOpinions").path("raw").asInt(0));
 
                 log.info("Successfully fetched company summary for {}", symbol);
-                return companySummary;
+                return cs;
 
             } catch (IOException ex) {
                 log.error("IOException on attempt {} for {}", attempts, symbol, ex);
-
                 if (attempts >= maxRetries) {
-                    throw new RuntimeException("Failed to fetch company summary after " + attempts + " attempts", ex);
+                    throw new RuntimeException(
+                            "Failed to fetch company summary after " + attempts + " attempts", ex);
                 }
-                // Refresh auth and retry
                 try {
                     log.warn("Refreshing auth before retry...");
                     authService.refreshAuthContext();
@@ -326,7 +411,8 @@ public class DefaultMarketClient implements ExternalMarketClient {
             }
         }
 
-        throw new RuntimeException("Failed to fetch company summary after " + maxRetries + " attempts");
+        throw new RuntimeException(
+                "Failed to fetch company summary for " + symbol + " after " + maxRetries + " attempts");
     }
 
     @Override
@@ -346,8 +432,8 @@ public class DefaultMarketClient implements ExternalMarketClient {
             attempts++;
             try {
                 final Map<String, String> params = new HashMap<>();
-                params.put("scrIds",screenerId);
-                params.put("count","20");
+                params.put("scrIds", screenerId);
+                params.put("count", "20");
 
                 // Build URL with auth (crumb)
                 String url = httpClient.buildUrlWithAuth(
@@ -480,5 +566,21 @@ public class DefaultMarketClient implements ExternalMarketClient {
         event.setTypeDisp(n.path("typeDisp").asText());
 
         return event;
+    }
+
+    /**
+     * Formats raw market cap (in INR) to "₹X.XX L.Cr" label.
+     * 1 Lakh Crore = 1,00,000 Cr = 1,000,000,000,000
+     */
+    private String formatToLakhCrore(double raw) {
+        double lakhCrore = raw / 1_00_00_00_00_000.0;
+        return String.format("%.2f L.Cr", lakhCrore);
+    }
+
+    private String resolveMarketCapCategory(double marketCapRaw) {
+        double crore = marketCapRaw / 1_00_00_000.0;
+        if (crore >= 20_000) return "Large Cap";
+        if (crore >= 5_000)  return "Mid Cap";
+        return "Small Cap";
     }
 }
